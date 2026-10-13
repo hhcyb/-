@@ -1,0 +1,2 @@
+# keep the frozen prompts byte-identical (their SHA-256 is in manifest.json)
+prepared/** -text

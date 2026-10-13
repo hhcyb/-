@@ -158,14 +158,102 @@ def classify(args, row):
             'retry_usage': retry_usage, 'reasoning_chars': len(reasoning or ''), 'raw': (content or '')[-3000:]}
 
 
+VULTRIAL_PROMPTS = HERE / 'vultrial_prompts.json'
+
+
+def target_source(row):
+    """The target function, recovered exactly from the frozen direct prompt ('TARGET FUNCTION:\\n```c\\n' + src + '\\n```')."""
+    content = row['messages'][-1]['content']
+    return content.split('TARGET FUNCTION:\n```c\n', 1)[1].rsplit('\n```', 1)[0]
+
+
+def vultrial_verdict(text):
+    """VulTrial's own rule (Evaluation/Script/eval_results_VulTrial.py, status 'action_and_valid_high'), kept as written:
+    vulnerable iff some review-board verdict is decision 'valid', severity 'high' and action 'fix immediately'."""
+    def check(k):
+        if k['recommended_action'] == 'fix immediately' and k['decision'] == 'valid' and k['severity'] == 'high':
+            return 1
+        return None
+    lines = text
+    if '</think>' in lines:
+        lines = lines.split('</think>')[-1]
+        lines = lines.split('```json\n')[-1]
+        lines = '```json\n' + lines
+    lines_updated = lines.replace('```json\n', '').replace('\n```', '')
+    vul_predict = 0
+    try:
+        vul_predict = 0
+        jury = json.loads(lines_updated)
+        try:
+            for k in jury:
+                if check(k):
+                    vul_predict = check(k)
+        except Exception:
+            if 'verdicts' in jury:
+                vul_predict = 0
+                for k in jury['verdicts']:
+                    if check(k):
+                        vul_predict = check(k)
+    except Exception:
+        if 'mitigate' in lines_updated.split('\n')[-1]:
+            vul_predict = 1
+    return vul_predict
+
+
+def vultrial(args, row, spec):
+    """One VulTrial trial (vultrial_base, max_turns 4): security researcher -> code author -> moderator -> review board.
+    Each call is a single message holding the filled template; chat history follows VulTrial's JudgeMemory: the
+    researcher's reply resets it, later replies are appended after a blank line, empty replies are skipped."""
+    from string import Template
+    code = target_source(row)
+    transcript, said, usage, reasoning = {}, [], {}, 0
+    status, error, prediction = 'ok', None, None
+    try:
+        for role in spec['order']:
+            history = ''
+            for sender, content in said:
+                history = content if sender == 'security_researcher' else history + '\n\n' + content
+            prompt = Template(spec['prompt_template']).safe_substitute(
+                role_description=spec['role_description'][role] + spec['code_separator'] + code, chat_history=history)
+            content, thought, finish, used = call(args, [{'role': args.vultrial_message_role, 'content': prompt}],
+                                                  args.max_tokens, args.thinking)
+            transcript[role] = content
+            usage[role] = dict(used or {}, finish_reason=finish)
+            reasoning += len(thought or '')
+            if content:
+                said.append((role, content))
+        prediction = vultrial_verdict(transcript.get('review_board', ''))
+    except PermanentError as exc:
+        status, error = 'error:permanent', str(exc)
+    except Exception as exc:
+        status, error = f'error:{type(exc).__name__}', str(exc)[:300]
+    return {'sample_id': row['sample_id'], 'prediction': prediction, 'status': status, 'error': error,
+            'output_truncated': any(u.get('finish_reason') == 'length' for u in usage.values()), 'usage': usage,
+            'reasoning_chars': reasoning, 'transcript': transcript}
+
+
+def say(text):
+    """Progress output must never stop a run (e.g. a closed console or pipe)."""
+    try:
+        print(text, flush=True)
+    except OSError:
+        pass
+
+
 def run_name(args):
     model = re.sub(r'[^A-Za-z0-9_.-]+', '-', args.model)
     return f'{args.condition}_{model}' + (f'_{args.tag}' if args.tag else '')
 
 
 def run(args):
-    prepared = PREPARED / f'{args.condition}.jsonl'
+    # VulTrial runs on the same frozen target functions as direct; its own prompts come from vultrial_prompts.json.
+    prepared = PREPARED / ('direct.jsonl' if args.condition == 'vultrial' else f'{args.condition}.jsonl')
     rows = read_rows(prepared)
+    spec = json.loads(VULTRIAL_PROMPTS.read_text(encoding='utf-8')) if args.condition == 'vultrial' else None
+    if args.subset == 'dev_a':
+        # Only the pair membership flag is read here; labels stay unused until `score`.
+        dev = {r['sample_id'] for r in read_rows(PREPARED / 'labels.jsonl') if r.get('dev_a')}
+        rows = [r for r in rows if r['sample_id'] in dev]
     if args.limit:
         rows = rows[:args.limit]
     if not os.environ.get(args.api_key_env):
@@ -177,6 +265,9 @@ def run(args):
     config = {k: getattr(args, k) for k in ('condition', 'model', 'api_base', 'max_tokens', 'temperature', 'seed',
                                             'thinking', 'stream', 'extra_body', 'limit')}
     config['prepared_sha256'] = file_sha256(prepared)
+    if spec is not None:
+        config.update(vultrial_prompts_sha256=file_sha256(VULTRIAL_PROMPTS),
+                      vultrial_message_role=args.vultrial_message_role)
     config_hash = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:16]
     if cfg_path.exists():
         old = json.loads(cfg_path.read_text(encoding='utf-8'))
@@ -189,10 +280,11 @@ def run(args):
     done = {r['sample_id'] for r in read_rows(out) if not str(r.get('status', '')).startswith('error')} \
         if out.exists() else set()
     todo = [r for r in rows if r['sample_id'] not in done]
-    print(f'{name}: {len(done)} done, {len(todo)} to run, {args.workers} workers', flush=True)
+    say(f'{name}: {len(done)} done, {len(todo)} to run, {args.workers} workers')
     lock, counts, started = threading.Lock(), Counter(), time.time()
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(classify, args, r) for r in todo]
+        futures = [pool.submit(vultrial, args, r, spec) if spec is not None else pool.submit(classify, args, r)
+                   for r in todo]
         # Written as each call finishes, so an interrupted run keeps everything already answered.
         for i, future in enumerate(cf.as_completed(futures), 1):
             result = future.result()
@@ -202,11 +294,10 @@ def run(args):
             counts[result['status']] += 1
             if i % 20 == 0 or i == len(todo):
                 rate = (time.time() - started) / i
-                print(f'  {len(done) + i}/{len(rows)}  {dict(counts)}  ~{rate * (len(todo) - i) / 60:.0f} min left',
-                      flush=True)
+                say(f'  {len(done) + i}/{len(rows)}  {dict(counts)}  ~{rate * (len(todo) - i) / 60:.0f} min left')
     failed = sum(v for k, v in counts.items() if k.startswith('error'))
     if failed:
-        print(f'{failed} calls failed; run the same command again to retry only those.', flush=True)
+        say(f'{failed} calls failed; run the same command again to retry only those.')
 
 
 def exact_mcnemar(gained, lost):
@@ -263,7 +354,9 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='mode', required=True)
     r = sub.add_parser('run')
-    r.add_argument('--condition', choices=['direct', 'graph_diff'], required=True)
+    r.add_argument('--condition', choices=['direct', 'graph_diff', 'vultrial'], required=True)
+    r.add_argument('--vultrial-message-role', choices=['system', 'user'], default='system',
+                   help="VulTrial sends each prompt as a single 'system' message; use 'user' only if the API rejects that")
     r.add_argument('--model', required=True, help='e.g. qwen3-32b')
     r.add_argument('--api-base', default='https://dashscope.aliyuncs.com/compatible-mode/v1')
     r.add_argument('--api-key-env', default='DASHSCOPE_API_KEY')
@@ -277,6 +370,8 @@ def main():
     r.add_argument('--extra-body', default='', help='JSON merged into every request body')
     r.add_argument('--timeout', type=int, default=900)
     r.add_argument('--retries', type=int, default=5)
+    r.add_argument('--subset', choices=['all', 'dev_a'], default='all',
+                   help='dev_a = the 100 development pairs only (pilot); a later full run reuses those results')
     r.add_argument('--limit', type=int, default=0, help='first N functions only (smoke test)')
     r.add_argument('--tag', default='')
     r.add_argument('--out', default=str(HERE.parent / 'results'))
