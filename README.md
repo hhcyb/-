@@ -58,7 +58,7 @@ python online/run_online.py run --condition vultrial --model qwen3.8-max --limit
 | `HTTP 429`（请求太频繁） | 降低并发，例如 `--workers 4` |
 
 ## 第 2 步：开发集试跑（direct 和 graph_diff，各 200 次调用）
-
+可选，可以不做。
 先在 100 对开发集上确认我们的方法在这个模型上有提升：
 
 ```bash
