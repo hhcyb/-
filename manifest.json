@@ -26,5 +26,25 @@
   "prepared/direct.jsonl": "5538125aaa3c6d29014950f5214c3d1e50865e6b80c0c7f71ab7094a28dc893f",
   "prepared/graph_diff.jsonl": "4a7def2efd0dbdcef788bc8f5872023793d54c230ebc39848ca4acdb298b9557",
   "prepared/labels.jsonl": "f0f0d6610138275ce1b5d4d94bf7238f114268d69734503f9d0c65171b22b930"
+ },
+ "baselines": {
+  "source": "KnowledgeRAG4LLMVulD/KnowledgeRAG4LLMVulD, VUL-RAG/src_baseline/baseline_detect.py (sha256 6bf3fe67c216a957f4336c210db76128938f5ef716c9b3b48a46a62904f62077)",
+  "retriever": "BM25 k1=1.2 b=0.75 over training vulnerable functions, top-1",
+  "leakage_excluded_train_pairs": 44,
+  "indexed_train_pairs": 3745,
+  "inputs_sha256": {
+   "knowledge": "8b4eb6f147843d4b313d7f79b92fb43ea6e50b6f6289448ab85608b005f6ae70",
+   "test_identities": "203d925eaf0ab62fc149cbfe9f295e3ba8b4c10074cfc64508e3de0561587b6d"
+  },
+  "files_sha256": {
+   "prepared/zero_shot.jsonl": "90e6491bfe1fc1e93143935ef73150c57960b425babd0f9ecc48e53fc2aceabd",
+   "prepared/code_rag.jsonl": "3856c527b5a159a38f7b90343ab5954a64eb53e756ef23ea4d200b6211ff8cac"
+  },
+  "code_rag_retrieval": {
+   "functions": 870,
+   "same_cwe": 99,
+   "same_project": 508,
+   "est_tokens_over_30k": 116
+  }
  }
 }

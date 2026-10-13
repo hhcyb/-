@@ -26,6 +26,7 @@ HERE = Path(__file__).resolve().parent
 PREPARED = HERE.parent / 'prepared'
 VERDICTS = {1: 1, 0: 0, True: 1, False: 0, '1': 1, '0': 0, 'true': 1, 'false': 0, 'yes': 1, 'no': 0}
 RETRY_PROMPT = 'Output only the final JSON object now.'
+RESULT_TAG_RETRY_PROMPT = 'Answer only with <result> YES </result> or <result> NO </result> now.'
 
 
 def file_sha256(path):
@@ -57,6 +58,21 @@ def extract_json(raw):
     return json.loads(found)
 
 
+def parse_result_tag(raw):
+    """Vul-RAG's rule (baseline_detect.extract_result_from_output after remove_thinking): the last
+    <result>...</result>; YES (checked first) -> 1, NO -> 0, anything else is a failed parse."""
+    text = re.sub(r'<think>.*?</think>', '', str(raw or ''), flags=re.S)
+    matches = re.findall(r'<result>(.*?)</result>', text, re.IGNORECASE | re.DOTALL)
+    if not matches:
+        raise ValueError('No <result> and </result> tags found')
+    content = matches[-1].strip().upper()
+    if 'YES' in content:
+        return 1
+    if 'NO' in content:
+        return 0
+    raise ValueError(f'Result contains neither YES nor NO: {content!r}')
+
+
 def parse_verdict(raw):
     value = extract_json(raw)
     verdict = value.get('vulnerable')
@@ -71,6 +87,16 @@ class PermanentError(Exception):
 
 
 def request_body(args, messages, max_tokens, thinking):
+    if args.api_style == 'ollama':
+        # Native Ollama /api/chat (local validation): num_ctx is sent with every request so a shared instance
+        # keeps its loaded context size instead of reloading the model.
+        body = {'model': args.model, 'messages': messages, 'stream': False,
+                'options': {'num_ctx': args.num_ctx, 'num_predict': max_tokens,
+                            **({'temperature': float(args.temperature)} if args.temperature != 'none' else {}),
+                            **({'seed': args.seed} if args.seed >= 0 else {})}}
+        if thinking in ('on', 'off'):
+            body['think'] = thinking == 'on'
+        return body, False
     body = {'model': args.model, 'messages': messages, 'max_tokens': max_tokens}
     if args.temperature != 'none':
         body['temperature'] = float(args.temperature)
@@ -89,6 +115,15 @@ def request_body(args, messages, max_tokens, thinking):
 def post(args, body, stream):
     """One HTTP call. Returns (content, reasoning, finish_reason, usage)."""
     data = json.dumps(body, ensure_ascii=False).encode('utf-8')
+    if args.api_style == 'ollama':
+        req = urllib.request.Request(args.api_base.rstrip('/') + '/api/chat', data=data, method='POST',
+                                     headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=args.timeout) as resp:
+            payload = json.loads(resp.read().decode('utf-8'))
+        msg = payload.get('message') or {}
+        finish = 'length' if payload.get('done_reason') == 'length' else payload.get('done_reason')
+        return (msg.get('content') or '', msg.get('thinking') or '', finish,
+                {'prompt_tokens': payload.get('prompt_eval_count'), 'completion_tokens': payload.get('eval_count')})
     req = urllib.request.Request(args.api_base.rstrip('/') + '/chat/completions', data=data, method='POST',
                                  headers={'Content-Type': 'application/json',
                                           'Authorization': 'Bearer ' + os.environ.get(args.api_key_env, '')})
@@ -139,15 +174,18 @@ def classify(args, row):
     """Same protocol as the local runs: reasoning first, one follow-up for the verdict only if it is missing."""
     status, prediction, error, usage, retry_usage = 'ok', None, None, {}, None
     content = reasoning = finish = ''
+    # Each prepared row names its answer format: our prompts end in JSON, the Vul-RAG baselines in <result> tags.
+    tagged = row.get('parser') == 'result_tag'
+    parse, retry_prompt = (parse_result_tag, RESULT_TAG_RETRY_PROMPT) if tagged else (parse_verdict, RETRY_PROMPT)
     try:
         content, reasoning, finish, usage = call(args, row['messages'], args.max_tokens, args.thinking)
         try:
-            prediction = parse_verdict(content)
+            prediction = parse(content)
         except ValueError:
             follow = row['messages'] + [{'role': 'assistant', 'content': content},
-                                        {'role': 'user', 'content': RETRY_PROMPT}]
+                                        {'role': 'user', 'content': retry_prompt}]
             retry, _, _, retry_usage = call(args, follow, 256, 'off' if args.thinking == 'on' else args.thinking)
-            prediction = parse_verdict(retry)
+            prediction = parse(retry)
             content, status = content + '\n[verdict-retry]\n' + retry, 'ok_after_retry'
     except PermanentError as exc:
         status, error = 'error:permanent', str(exc)
@@ -256,7 +294,12 @@ def run(args):
         rows = [r for r in rows if r['sample_id'] in dev]
     if args.limit:
         rows = rows[:args.limit]
-    if not os.environ.get(args.api_key_env):
+    if args.max_prompt_chars:
+        # Local validation only: skip prompts a small local context cannot hold (recorded, never silently cut).
+        too_long = [r['sample_id'] for r in rows if sum(len(m['content']) for m in r['messages']) > args.max_prompt_chars]
+        rows = [r for r in rows if r['sample_id'] not in set(too_long)]
+        say(f'skipped {len(too_long)} prompts longer than {args.max_prompt_chars} characters')
+    if args.api_style == 'openai' and not os.environ.get(args.api_key_env):
         sys.exit(f'Environment variable {args.api_key_env} is empty; set your API key first.')
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -264,6 +307,8 @@ def run(args):
     out, cfg_path = out_dir / f'predictions_{name}.jsonl', out_dir / f'run_config_{name}.json'
     config = {k: getattr(args, k) for k in ('condition', 'model', 'api_base', 'max_tokens', 'temperature', 'seed',
                                             'thinking', 'stream', 'extra_body', 'limit')}
+    if args.api_style == 'ollama':
+        config.update(api_style='ollama', num_ctx=args.num_ctx)  # only when used: earlier config hashes stay valid
     config['prepared_sha256'] = file_sha256(prepared)
     if spec is not None:
         config.update(vultrial_prompts_sha256=file_sha256(VULTRIAL_PROMPTS),
@@ -354,12 +399,17 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest='mode', required=True)
     r = sub.add_parser('run')
-    r.add_argument('--condition', choices=['direct', 'graph_diff', 'vultrial'], required=True)
+    r.add_argument('--condition', choices=['direct', 'graph_diff', 'vultrial', 'zero_shot', 'code_rag'], required=True)
     r.add_argument('--vultrial-message-role', choices=['system', 'user'], default='system',
                    help="VulTrial sends each prompt as a single 'system' message; use 'user' only if the API rejects that")
     r.add_argument('--model', required=True, help='e.g. qwen3-32b')
     r.add_argument('--api-base', default='https://dashscope.aliyuncs.com/compatible-mode/v1')
     r.add_argument('--api-key-env', default='DASHSCOPE_API_KEY')
+    r.add_argument('--api-style', choices=['openai', 'ollama'], default='openai',
+                   help="ollama = native /api/chat on a local Ollama (validation runs); api-base is then e.g. http://127.0.0.1:11437")
+    r.add_argument('--num-ctx', type=int, default=32768, help='ollama style only: context window sent with each request')
+    r.add_argument('--max-prompt-chars', type=int, default=0,
+                   help='skip prompts longer than this (local validation with a small context); 0 = keep all')
     r.add_argument('--workers', type=int, default=8)
     r.add_argument('--max-tokens', type=int, default=8192)
     r.add_argument('--temperature', default='0', help="a number, or 'none' to omit it")
