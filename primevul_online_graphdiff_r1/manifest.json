@@ -1,0 +1,30 @@
+{
+ "created_utc": "2026-10-13T04:27:12+00:00",
+ "functions": 870,
+ "pairs": 435,
+ "dev_a_pairs": 100,
+ "graph_diff_functions_with_evidence": 736,
+ "graph_diff_counts": {
+  "cards": 2220,
+  "dropped_leakage": 57,
+  "functions_with_examples": 736,
+  "leakage_excluded_train_pairs": 44
+ },
+ "diff_max_lines": 60,
+ "inputs_sha256": {
+  "test": "b4d17371e8345c6e11d9e5a6c9620ac584c1d9c7226909b39bf154cb2d57a158",
+  "knowledge": "8b4eb6f147843d4b313d7f79b92fb43ea6e50b6f6289448ab85608b005f6ae70",
+  "evidence": "af843240df15343efbbdf655d3b762b1736eed08fdbb2e8dee76f62e12078fed",
+  "dev_pairs": "8268e4437a7e3fdd96a323326367f6ea05085715fd1b6fadb22b43edff13f532"
+ },
+ "code_sha256": {
+  "prepare": "2c14f1eed36ab8b6bc478dc65cd113229e0da7b83310393b7c858c4a6df90967",
+  "prompts": "899b775b52c46bcea2dbea6b9234783761bcde0904bfdaa4c3379e127ccd2b2e",
+  "local_runner": "7fae96ef97d024ae2e3fa82ce2f47c273ce7fdad5255ccd0d7c4556340f056a1"
+ },
+ "files_sha256": {
+  "prepared/direct.jsonl": "5538125aaa3c6d29014950f5214c3d1e50865e6b80c0c7f71ab7094a28dc893f",
+  "prepared/graph_diff.jsonl": "4a7def2efd0dbdcef788bc8f5872023793d54c230ebc39848ca4acdb298b9557",
+  "prepared/labels.jsonl": "f0f0d6610138275ce1b5d4d94bf7238f114268d69734503f9d0c65171b22b930"
+ }
+}
